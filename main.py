@@ -1,118 +1,150 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from openpyxl import load_workbook
+from openpyxl import load_workbook, Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.reader.excel import InvalidFileException
+import pandas as pd
 import shutil
 import os
 from tempfile import NamedTemporaryFile
 from datetime import datetime
+from typing import Optional
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-def copy_sheet(source_sheet, target_wb, sheet_name):
-    """Copy a sheet with all formatting, formulas, and dimensions"""
-    new_sheet = target_wb.create_sheet(sheet_name)
-    
-    # Copy column dimensions
-    for col in range(1, source_sheet.max_column + 1):
-        col_letter = get_column_letter(col)
-        new_sheet.column_dimensions[col_letter].width = source_sheet.column_dimensions[col_letter].width
-    
-    # Copy row dimensions
-    for row in range(1, source_sheet.max_row + 1):
-        new_sheet.row_dimensions[row].height = source_sheet.row_dimensions[row].height
-    
-    # Copy merged cells
-    for merged_range in source_sheet.merged_cells.ranges:
-        new_sheet.merge_cells(str(merged_range))
-    
-    # Copy cells with values, formulas, and formatting
-    for row in source_sheet.iter_rows():
-        for cell in row:
-            new_cell = new_sheet.cell(
-                row=cell.row,
-                column=cell.column,
-                value=cell.value
-            )
-            
-            # Preserve formulas
-            if cell.data_type == 'f':
-                new_cell.value = cell.value
-            
-            # Copy all styling attributes
-            if cell.has_style:
-                new_cell.font = cell.font.copy()
-                new_cell.border = cell.border.copy()
-                new_cell.fill = cell.fill.copy()
-                new_cell.number_format = cell.number_format
-                new_cell.protection = cell.protection.copy()
-                new_cell.alignment = cell.alignment.copy()
-    
-    return new_sheet
+def cleanup_files(*file_paths):
+    """Clean up temporary files."""
+    for path in file_paths:
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError as e:
+                print(f"Error removing file {path}: {e}")
 
 def update_valuation_date(sheet):
-    """Update valuation date to current date"""
+    """Update the valuation date in the DCF model to the current date."""
     for row in sheet.iter_rows():
         for cell in row:
-            if cell.value and "Valuation Date" in str(cell.value):
+            if isinstance(cell.value, str) and "Valuation Date" in cell.value:
                 date_cell = sheet.cell(row=cell.row, column=cell.column + 2)
                 date_cell.value = datetime.now().date()
+                date_cell.number_format = 'YYYY-MM-DD'
                 return
 
+def load_file_content(file_path):
+    """Loads file content as a DataFrame, handling both XLSX and CSV."""
+    try:
+        # Try to load as an XLSX file first
+        wb = load_workbook(file_path)
+        sheet = wb.active
+        data = sheet.values
+        # Create a DataFrame from the sheet data
+        cols = next(data)
+        data = list(data)
+        df = pd.DataFrame(data, columns=cols)
+        return df
+    except InvalidFileException:
+        # If it's not a valid XLSX, fall back to CSV
+        print("Invalid XLSX file, attempting to read as CSV...")
+        try:
+            return pd.read_csv(file_path)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not read the uploaded file as a CSV: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read the uploaded file: {str(e)}")
+
 @app.post("/upload")
-async def upload(consensus: UploadFile = File(...), profile: UploadFile = File(None)):
-    consensus_path = "temp_consensus.xlsx"
+async def upload(
+    background_tasks: BackgroundTasks, 
+    consensus: UploadFile = File(...), 
+    profile: Optional[UploadFile] = File(None)
+):
+    consensus_path = None
     profile_path = None
+    output_path = None
     
     try:
-        # Save uploaded files
+        # Save uploaded files temporarily
+        consensus_path = f"temp_consensus.tmp"
         with open(consensus_path, "wb") as f:
             shutil.copyfileobj(consensus.file, f)
-            
-        if profile:
-            profile_path = "temp_profile.xlsx"
+        
+        if profile and profile.filename:
+            profile_path = f"temp_profile.tmp"
             with open(profile_path, "wb") as f:
                 shutil.copyfileobj(profile.file, f)
 
-        # Create new workbook for output
-        output_wb = load_workbook(consensus_path)
+        # Load the local template file
+        template_wb = load_workbook("Template.xlsx")
         
-        # Add Corporate Profile sheets if provided
-        if profile_path:
-            profile_wb = load_workbook(profile_path)
-            for sheet_name in profile_wb.sheetnames:
-                sheet = profile_wb[sheet_name]
-                new_sheet = copy_sheet(sheet, output_wb, sheet_name)
+        # Create a new workbook to hold the final result
+        merged_wb = Workbook()
         
-        # Add DCF Model sheet
-        dcf_wb = load_workbook("DCF Model.xlsx")
-        dcf_sheet = dcf_wb["DCF Model"]
-        new_dcf_sheet = copy_sheet(dcf_sheet, output_wb, "DCF Model")
+        # --- Process Consensus File ---
+        consensus_df = load_file_content(consensus_path)
+        ws_consensus = merged_wb.create_sheet("Consensus")
+        for r in dataframe_to_rows(consensus_df, index=False, header=True):
+            ws_consensus.append(r)
+        
+        # --- Process Profile File (Optional) ---
+        if profile_path and os.path.exists(profile_path):
+            profile_df = load_file_content(profile_path)
+            ws_profile = merged_wb.create_sheet("Public Company")
+            for r in dataframe_to_rows(profile_df, index=False, header=True):
+                ws_profile.append(r)
+
+        # --- Copy DCF Model from Template, preserving formulas ---
+        dcf_sheet = template_wb["DCF Model"]
+        new_dcf_sheet = merged_wb.create_sheet("DCF Model Output")
+        
+        for row in dcf_sheet.iter_rows():
+            for cell in row:
+                new_cell = new_dcf_sheet.cell(
+                    row=cell.row, 
+                    column=cell.column
+                )
+                # Copy formula if it exists. This is the key fix.
+                if cell.data_type == 'f':
+                    new_cell.value = cell.formula
+                else:
+                    new_cell.value = cell.value
+
+                # Copy styling (font, border, fill, etc.)
+                if cell.has_style:
+                    new_cell.font = cell.font.copy()
+                    new_cell.border = cell.border.copy()
+                    new_cell.fill = cell.fill.copy()
+                    new_cell.number_format = cell.number_format
+                    new_cell.protection = cell.protection.copy()
+                    new_cell.alignment = cell.alignment.copy()
+        
+        # --- Finalize Workbook ---
+        if "Sheet" in merged_wb.sheetnames:
+            merged_wb.remove(merged_wb["Sheet"])
+            
         update_valuation_date(new_dcf_sheet)
         
-        # Save combined workbook
+        # Save to temporary file
         temp_file = NamedTemporaryFile(delete=False, suffix=".xlsx")
-        output_wb.save(temp_file.name)
+        merged_wb.save(temp_file.name)
         
-        return StreamingResponse(
-            open(temp_file.name, "rb"),
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=DCF_Model.xlsx"},
-        )
+        # Add cleanup to run in the background
+        cleanup_files_list = [consensus_path, temp_file.name]
+        if profile_path:
+            cleanup_files_list.append(profile_path)
+        background_tasks.add_task(cleanup_files, *cleanup_files_list)
+        
+        # Return the generated file using a StreamingResponse
+        def file_iterator():
+            with open(temp_file.name, "rb") as f:
+                yield from f
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return StreamingResponse(
+            file_iterator(),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename=Merged Solution.xlsx"},
+        )
     
-    finally:
-        # Clean up temporary files
-        for path in [consensus_path, profile_path]:
-            if path and os.path.exists(path):
-                os.remove(path)
+    except Exception as e:
+        cleanup_files(consensus_path, profile_path, output_path)
+        raise HTTPException(status_code=500, detail=f"Error processing files: {str(e)}")
