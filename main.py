@@ -4,8 +4,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import load_workbook
 import shutil
 import os
-import tempfile
-from copy import copy
+import copy
+from tempfile import NamedTemporaryFile
+from openpyxl.utils import get_column_letter
 
 app = FastAPI()
 
@@ -17,94 +18,89 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def copy_sheet(source_sheet, target_wb, sheet_name=None):
-    """Copy a worksheet to another workbook preserving all formatting"""
-    target_sheet = target_wb.create_sheet(sheet_name or source_sheet.title)
-    
-    # Copy merged cells
-    for merged_range in source_sheet.merged_cells.ranges:
-        target_sheet.merge_cells(str(merged_range))
-    
-    # Copy row dimensions
-    for idx, dim in source_sheet.row_dimensions.items():
-        new_dim = copy(dim)
-        target_sheet.row_dimensions[idx] = new_dim
-    
-    # Copy column dimensions
-    for col_letter, dim in source_sheet.column_dimensions.items():
-        new_dim = copy(dim)
-        target_sheet.column_dimensions[col_letter] = new_dim
-    
-    # Copy all cell values and styles
+def copy_sheet(source_sheet, target_sheet):
+    """Copy all cell values, styles, dimensions and merged cells between sheets"""
     for row in source_sheet.iter_rows():
         for cell in row:
-            new_cell = target_sheet.cell(
-                row=cell.row, 
-                column=cell.column, 
-                value=cell.value
-            )
+            new_cell = target_sheet.cell(row=cell.row, column=cell.column, value=cell.value)
             if cell.has_style:
-                new_cell.font = copy(cell.font)
-                new_cell.border = copy(cell.border)
-                new_cell.fill = copy(cell.fill)
+                new_cell.font = copy.copy(cell.font)
+                new_cell.border = copy.copy(cell.border)
+                new_cell.fill = copy.copy(cell.fill)
                 new_cell.number_format = cell.number_format
-                new_cell.protection = copy(cell.protection)
-                new_cell.alignment = copy(cell.alignment)
-    
-    # Copy conditional formatting
-    for cf in source_sheet.conditional_formatting:
-        target_sheet.conditional_formatting.add(cf)
-    
-    return target_sheet
+                new_cell.protection = copy.copy(cell.protection)
+                new_cell.alignment = copy.copy(cell.alignment)
+
+    # Copy column dimensions
+    for col_letter, col_dim in source_sheet.column_dimensions.items():
+        target_sheet.column_dimensions[col_letter] = copy.copy(col_dim)
+
+    # Copy row dimensions
+    for row_idx, row_dim in source_sheet.row_dimensions.items():
+        target_sheet.row_dimensions[row_idx] = copy.copy(row_dim)
+
+    # Copy merged cells
+    for merge_range in source_sheet.merged_cells.ranges:
+        target_sheet.merge_cells(str(merge_range))
 
 @app.post("/upload")
 async def upload(consensus: UploadFile = File(...), profile: UploadFile = File(None)):
     try:
-        # Load DCF template
-        template_wb = load_workbook("DCF Model.xlsx")
-        template_sheet = template_wb["DCF Model"]
-        
-        # Create new workbook
-        output_wb = load_workbook("DCF Model.xlsx")
-        output_wb.remove(output_wb.active)  # Remove default sheet
-        
-        # Process consensus file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_consensus:
-            shutil.copyfileobj(consensus.file, tmp_consensus)
-            consensus_wb = load_workbook(tmp_consensus.name)
-            consensus_sheet = consensus_wb["Consensus"]
-            copy_sheet(consensus_sheet, output_wb, "Consensus")
-            os.unlink(tmp_consensus.name)
-        
-        # Process profile file if provided
+        # Save uploaded files temporarily
+        consensus_path = "temp_consensus.xlsx"
+        with open(consensus_path, "wb") as f:
+            shutil.copyfileobj(consensus.file, f)
+
+        profile_path = None
         if profile:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_profile:
-                shutil.copyfileobj(profile.file, tmp_profile)
-                profile_wb = load_workbook(tmp_profile.name)
-                public_sheet = profile_wb["Public Company"]
-                copy_sheet(public_sheet, output_wb, "Public Company")
-                os.unlink(tmp_profile.name)
+            profile_path = "temp_profile.xlsx"
+            with open(profile_path, "wb") as f:
+                shutil.copyfileobj(profile.file, f)
+
+        # Load base DCF model
+        base_wb = load_workbook("DCF Model.xlsx", data_only=False)
         
-        # Add DCF Model sheet
-        copy_sheet(template_sheet, output_wb, "DCF Model")
+        # Load consensus file and copy sheet
+        consensus_wb = load_workbook(consensus_path, data_only=False)
+        if "Consensus" not in consensus_wb.sheetnames:
+            raise HTTPException(status_code=400, detail="Consensus sheet not found in uploaded file")
         
+        # Create new Consensus sheet in base workbook
+        if "Consensus" in base_wb.sheetnames:
+            base_wb.remove(base_wb["Consensus"])
+        new_consensus = base_wb.create_sheet("Consensus")
+        copy_sheet(consensus_wb["Consensus"], new_consensus)
+        consensus_wb.close()
+
+        # Load profile file and copy sheet if provided
+        if profile_path:
+            profile_wb = load_workbook(profile_path, data_only=False)
+            if "Public Company" not in profile_wb.sheetnames:
+                raise HTTPException(status_code=400, detail="Public Company sheet not found in uploaded file")
+            
+            if "Public Company" in base_wb.sheetnames:
+                base_wb.remove(base_wb["Public Company"])
+            new_public = base_wb.create_sheet("Public Company")
+            copy_sheet(profile_wb["Public Company"], new_public)
+            profile_wb.close()
+
         # Save to temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_output:
-            output_wb.save(tmp_output.name)
-            tmp_path = tmp_output.name
-        
+        temp_file = NamedTemporaryFile(delete=False, suffix=".xlsx")
+        base_wb.save(temp_file.name)
+        base_wb.close()
+
         # Return the generated file
         return StreamingResponse(
-            open(tmp_path, "rb"),
+            open(temp_file.name, "rb"),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={"Content-Disposition": "attachment; filename=DCF_Model.xlsx"},
         )
 
-    except KeyError as e:
-        raise HTTPException(status_code=400, detail=f"Missing required sheet: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         # Clean up temporary files
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        if os.path.exists(consensus_path):
+            os.remove(consensus_path)
+        if profile_path and os.path.exists(profile_path):
+            os.remove(profile_path)
