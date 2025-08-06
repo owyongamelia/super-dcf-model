@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
+from openpyxl import load_workbook
 import shutil
 import os
 from tempfile import NamedTemporaryFile
@@ -52,35 +52,21 @@ async def upload(consensus: UploadFile = File(...), profile: UploadFile = File(N
 
 def generate_output_file(consensus_path, profile_path):
     try:
-        # Create a new Excel writer
-        with NamedTemporaryFile(delete=False, suffix=".xlsx") as temp_file:
-            output_path = temp_file.name
+        # Load the template
+        template = load_workbook("Template.xlsx")
         
-        # Load consensus file
-        consensus_df = pd.read_excel(consensus_path, sheet_name=None)
+        # Create a new workbook with only the DCF Model sheet
+        output_wb = load_workbook("Template.xlsx")
         
-        # Load profile file if exists
-        profile_dfs = {}
-        if profile_path:
-            profile_dfs = pd.read_excel(profile_path, sheet_name=None)
+        # Remove all sheets except DCF Model
+        for sheet_name in output_wb.sheetnames:
+            if sheet_name != "DCF Model":
+                output_wb.remove(output_wb[sheet_name])
         
-        # Load DCF Model
-        dcf_model_df = pd.read_excel("DCF_Model.xlsx", sheet_name="DCF Model")
-        
-        # Create new workbook with all sheets
-        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            # Write all sheets from consensus
-            for sheet_name, df in consensus_df.items():
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
-            
-            # Write all sheets from profile
-            for sheet_name, df in profile_dfs.items():
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
-            
-            # Write DCF Model sheet
-            dcf_model_df.to_excel(writer, sheet_name="DCF Model", index=False)
-        
-        return output_path
+        # Save to temporary file
+        temp_file = NamedTemporaryFile(delete=False, suffix=".xlsx")
+        output_wb.save(temp_file.name)
+        return temp_file.name
         
     except Exception as e:
         raise Exception(f"Error generating output file: {str(e)}")
